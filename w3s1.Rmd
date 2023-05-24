@@ -1,0 +1,204 @@
+---
+title: "Week 3, Session 1"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+```
+
+## Prepare the dataset 
+
+Run the code from the "starter" script I have shared, all in one go. We'll save it at the end of this chunk, to save time in future exercises.
+
+```{r starter-code}
+# change to your own path!
+data_path <- "C:/Users/vrind/OneDrive/Desktop/Course terms/Summer Term/People Analytics/Week 2/"
+applications <- read_parquet(paste0(data_path,"app_data_sample.parquet"))
+
+library(gender)
+#install_genderdata_package() # only run this line the first time you use the package, to get data for it
+# get a list of first names without repetitions
+examiner_names <- applications |> 
+  distinct(examiner_name_first)
+
+# get a table of names and gender
+examiner_names_gender <- examiner_names |> 
+  do(results = gender(.$examiner_name_first, method = "ssa")) |> 
+  unnest(cols = c(results), keep_empty = TRUE) |> 
+  select(
+    examiner_name_first = name,
+    gender,
+    proportion_female
+  ) |> 
+  select(examiner_name_first, gender)
+
+# joining gender back to the dataset
+applications <- applications |> 
+  left_join(examiner_names_gender, by = "examiner_name_first")
+# cleaning up
+rm(examiner_names)
+rm(examiner_names_gender)
+gc()
+
+## Get race
+library(wru)
+examiner_surnames <- applications |> 
+  select(surname = examiner_name_last) |> 
+  distinct()
+examiner_race <- predict_race(voter.file = examiner_surnames, surname.only = T) |> 
+  as_tibble() |> 
+  mutate(max_race_p = pmax(pred.asi, pred.bla, pred.his, pred.oth, pred.whi)) |> 
+  mutate(race = case_when(
+    max_race_p == pred.asi ~ "Asian",
+    max_race_p == pred.bla ~ "black",
+    max_race_p == pred.his ~ "Hispanic",
+    max_race_p == pred.oth ~ "other",
+    max_race_p == pred.whi ~ "white",
+    TRUE ~ NA_character_
+  )) |> 
+  select(surname,race)
+
+# joining race back to the dataset
+applications <- applications |> 
+  left_join(examiner_race, by = c("examiner_name_last" = "surname"))
+rm(examiner_race)
+rm(examiner_surnames)
+gc()
+
+## Get tenure
+library(lubridate) # to work with dates
+examiner_dates <- applications |> 
+  select(examiner_id, filing_date, appl_status_date) |> 
+  mutate(start_date = ymd(filing_date), end_date = as_date(dmy_hms(appl_status_date))) |> 
+  group_by(examiner_id) |> 
+  summarise(
+    earliest_date = min(start_date, na.rm = TRUE), 
+    latest_date = max(end_date, na.rm = TRUE),
+    tenure_days = interval(earliest_date, latest_date) %/% days(1)
+    ) 
+
+## Join back to applications
+applications <- applications |> 
+  left_join(examiner_dates, by = "examiner_id")
+rm(examiner_dates)
+gc()
+
+## write out to file, to save time in future exercises
+write_feather(applications, paste0(data_path,"app_data_starter.feather"))
+
+
+```
+
+## Look at examiners demographics
+
+The first thing to note here is that our unit of interest is an *examiner*, but our data is at the level of a *patent application*. Examiners work with many patent applications during their tenure at the USPTO. Those who have longer tenure in our sample will have worked on more applications, and so if we count the number of *records* with attributes `male` or `female`, we will overcount those who have worked there longer.
+
+We may be better off creating a separate table---a.k.a. a *dataframe*---where there is only one record per examiner. In other words, we need to "collapse" the applications data, with multiple records per examiner, to examiner-level data, where we only have one record per individual.
+
+```{r count-examiners}
+library(dplyr)
+applications %>%
+  distinct(examiner_id) %>%
+  count()
+```
+
+### Compare TCs by gender graphically
+This is what chatGPT gave us:
+
+```{r compare-tcs-gender}
+library(dplyr)
+library(ggplot2)
+applications %>%
+  group_by(tc, gender) %>%
+  #filter(!is.na(gender)) %>%
+  summarise(n = n_distinct(examiner_id)) %>%
+  ggplot(aes(x = as.factor(tc), y = n, fill = gender)) +
+  geom_col(position = "dodge") +
+  ylab("Examiners")
+```
+
+```{r compare-tcs-race}
+library(dplyr)
+library(ggplot2)
+applications %>%
+  group_by(tc, race) %>%
+  #filter(!is.na(race)) %>%
+  summarise(n = n_distinct(examiner_id)) %>%
+  ggplot(aes(x = as.factor(tc), y = n, fill = race)) +
+  geom_col(position = "dodge") +
+  ylab("Examiners")
+```
+
+```{r compare-tcs-tenure}
+library(dplyr)
+library(ggplot2)
+applications %>%
+  group_by(tc, tenure_days) %>%
+  #filter(!is.na(tenure_days)) %>%
+  summarise(n = n_distinct(examiner_id)) %>%
+  ggplot(aes(x = as.factor(tc), y = n, fill = tenure_days)) +
+  geom_col(position = "dodge") +
+  ylab("Examiners")
+```
+
+## Correlations
+
+We have tenure for each person and we want to know whether tenure is predicted by gender.
+
+```{r correlations-gender}
+library(dplyr)
+examiners <- applications %>%
+  group_by(examiner_id) %>%
+  summarise(
+    tenure = first(tenure_days), 
+    gender = first(gender),
+    race = first(race)
+    )
+
+library(broom)
+fit <- lm(tenure ~ gender + race, data = examiners)
+tidy(fit)
+```
+
+``` {r data-split}
+library(dplyr)
+
+# Set the seed for reproducibility
+set.seed(123)
+
+# Define the proportion of data to be used as a subsample
+subsample_prop <- 0.8  # 80% for subsample, 20% for holdout
+
+# Split the data into subsample and holdout using the subsample proportion
+subsample <- examiners %>%
+  sample_frac(subsample_prop)
+
+holdout <- examiners %>%
+  anti_join(subsample, by = "examiner_id")
+```
+
+
+```{r turnover}
+# Calculate turnover rates by gender in the subsample
+turnover_gender <- subsample %>%
+  group_by(gender) %>%
+  summarize(turnover_rate = sum(appl_status == "Terminated") / n())
+
+
+
+# Calculate turnover rates by race in the subsample
+turnover_race <- subsample %>%
+  group_by(race) %>%
+  summarize(turnover_rate = sum(appl_status == "Terminated") / n())
+
+# Print the turnover rates by gender
+print(turnover_gender)
+
+# Print the turnover rates by race
+print(turnover_race)
+
+```
